@@ -1,109 +1,222 @@
 package com.example.speedtest
 
 import android.os.Bundle
+import android.content.SharedPreferences
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.coroutines.*
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    private var running = false
+    private var testJob: Job? = null
+
+    // أضف هنا روابط سيرفرات إضافية إذا توفرت، يختار التطبيق الأسرع تلقائياً
+    private val servers = listOf("https://speed.cloudflare.com")
+    private val parallelStreams = 4
+    private val phaseMs = 10_000L
+    private val chunk = 64 * 1024
+
+    private lateinit var gauge: GaugeView
+    private lateinit var goBtn: TextView
+    private lateinit var speedText: TextView
+    private lateinit var unitText: TextView
+    private lateinit var statusText: TextView
+    private lateinit var pingValue: TextView
+    private lateinit var downValue: TextView
+    private lateinit var upValue: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        val gauge = findViewById<GaugeView>(R.id.gauge)
-        val goBtn = findViewById<TextView>(R.id.goBtn)
-        val speedText = findViewById<TextView>(R.id.speedText)
-        val unitText = findViewById<TextView>(R.id.unitText)
-        val statusText = findViewById<TextView>(R.id.statusText)
-        val pingValue = findViewById<TextView>(R.id.pingValue)
-        val downValue = findViewById<TextView>(R.id.downValue)
-        val upValue = findViewById<TextView>(R.id.upValue)
+        gauge = findViewById<GaugeView>(R.id.gauge)
+        goBtn = findViewById<TextView>(R.id.goBtn)
+        speedText = findViewById<TextView>(R.id.speedText)
+        unitText = findViewById<TextView>(R.id.unitText)
+        statusText = findViewById<TextView>(R.id.statusText)
+        pingValue = findViewById<TextView>(R.id.pingValue)
+        downValue = findViewById<TextView>(R.id.downValue)
+        upValue = findViewById<TextView>(R.id.upValue)
+
+        val prefs = getSharedPreferences("speedtest", MODE_PRIVATE)
+        prefs.getString("last", null)?.let { statusText.text = "Last: $it" }
 
         goBtn.setOnClickListener {
-            if (running) return@setOnClickListener
-            running = true
-            goBtn.text = "Testing..."
-            scope.launch {
-                try {
-                    statusText.text = "Measuring ping"
-                    speedText.text = "..."
-                    unitText.text = "ms"
-                    val ping = withContext(Dispatchers.IO) { measurePing() }
-                    pingValue.text = "%.0f ms".format(ping)
+            val current = testJob
+            if (current != null && current.isActive) {
+                current.cancel()
+                return@setOnClickListener
+            }
+            testJob = scope.launch { runTest(prefs) }
+        }
+    }
 
-                    statusText.text = "Testing download"
-                    unitText.text = "Mbps"
-                    val down = withContext(Dispatchers.IO) { measureDownload() }
-                    gauge.setSpeed(down)
-                    speedText.text = "%.1f".format(down)
-                    downValue.text = "%.1f Mbps".format(down)
+    private suspend fun runTest(prefs: SharedPreferences) {
+        goBtn.text = "Cancel"
+        try {
+            statusText.text = "Finding best server..."
+            gauge.setSpeed(0.0)
+            speedText.text = "--"
+            unitText.text = "ms"
 
-                    statusText.text = "Testing upload"
-                    val up = withContext(Dispatchers.IO) { measureUpload() }
-                    gauge.setSpeed(up)
-                    speedText.text = "%.1f".format(up)
-                    upValue.text = "%.1f Mbps".format(up)
+            val (server, pingResult) = withContext(Dispatchers.IO) { pickServer() }
+            val (pingMin, jitter) = pingResult
+            pingValue.text = "%.0f ms".format(pingMin)
+            statusText.text = "Ping %.0f ms · Jitter %.1f ms".format(pingMin, jitter)
 
-                    statusText.text = "Test complete"
-                } catch (e: Exception) {
-                    statusText.text = "Error: ${e.message}"
-                } finally {
-                    running = false
-                    goBtn.text = "Start test"
+            statusText.text = "Testing download..."
+            unitText.text = "Mbps"
+            val down = runPhase { counter, deadline, alive ->
+                downloadWorker(server, counter, deadline, alive)
+            }
+            gauge.setSpeed(down)
+            speedText.text = "%.1f".format(down)
+            downValue.text = "%.1f Mbps".format(down)
+
+            statusText.text = "Testing upload..."
+            val up = runPhase { counter, deadline, alive ->
+                uploadWorker(server, counter, deadline, alive)
+            }
+            gauge.setSpeed(up)
+            speedText.text = "%.1f".format(up)
+            upValue.text = "%.1f Mbps".format(up)
+
+            statusText.text = "Test complete"
+            val summary = "↓ %.1f  ↑ %.1f Mbps  ·  %.0f ms".format(down, up, pingMin)
+            prefs.edit().putString("last", summary).apply()
+        } catch (e: CancellationException) {
+            statusText.text = "Cancelled"
+            gauge.setSpeed(0.0)
+        } catch (e: Exception) {
+            statusText.text = "Error: ${e.message}"
+        } finally {
+            goBtn.text = "Start test"
+        }
+    }
+
+    // يشغّل مرحلة واحدة (تحميل أو رفع) مع عداد حي وإرجاع المتوسط
+    private suspend fun runPhase(
+        worker: (AtomicLong, Long, () -> Boolean) -> Unit
+    ): Double = coroutineScope {
+        val counter = AtomicLong(0)
+        val deadline = System.currentTimeMillis() + phaseMs
+        val start = System.nanoTime()
+
+        // تحديث العداد الحي كل 250ms على الـ Main thread
+        val ticker = launch(Dispatchers.Main) {
+            var lastBytes = 0L
+            var lastTime = System.nanoTime()
+            while (true) {
+                delay(250)
+                val now = System.nanoTime()
+                val bytes = counter.get()
+                val seconds = (now - lastTime) / 1e9
+                val mbps = if (seconds > 0) (bytes - lastBytes) * 8.0 / seconds / 1e6 else 0.0
+                lastBytes = bytes
+                lastTime = now
+                gauge.setSpeed(mbps)
+                speedText.text = "%.1f".format(mbps)
+            }
+        }
+
+        withContext(Dispatchers.IO) {
+            coroutineScope {
+                repeat(parallelStreams) {
+                    launch {
+                        worker(counter, deadline) { isActive }
+                    }
                 }
+            }
+        }
+
+        ticker.cancel()
+        val seconds = (System.nanoTime() - start) / 1e9
+        counter.get() * 8.0 / seconds / 1e6
+    }
+
+    private fun downloadWorker(
+        server: String,
+        counter: AtomicLong,
+        deadline: Long,
+        alive: () -> Boolean
+    ) {
+        val buf = ByteArray(chunk)
+        while (alive() && System.currentTimeMillis() < deadline) {
+            val conn = URL("$server/__down?bytes=25000000").openConnection() as HttpURLConnection
+            conn.connectTimeout = 8000
+            conn.readTimeout = 8000
+            try {
+                conn.inputStream.use { input ->
+                    while (alive() && System.currentTimeMillis() < deadline) {
+                        val n = input.read(buf)
+                        if (n <= 0) break
+                        counter.addAndGet(n.toLong())
+                    }
+                }
+            } finally {
+                conn.disconnect()
             }
         }
     }
 
-    private fun measurePing(): Double {
+    private fun uploadWorker(
+        server: String,
+        counter: AtomicLong,
+        deadline: Long,
+        alive: () -> Boolean
+    ) {
+        val buf = ByteArray(chunk)
+        while (alive() && System.currentTimeMillis() < deadline) {
+            val conn = URL("$server/__up").openConnection() as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.connectTimeout = 8000
+            conn.readTimeout = 15000
+            conn.setChunkedStreamingMode(chunk)
+            try {
+                conn.outputStream.use { out ->
+                    while (alive() && System.currentTimeMillis() < deadline) {
+                        out.write(buf)
+                        counter.addAndGet(buf.size.toLong())
+                    }
+                }
+                conn.inputStream.use { it.readBytes() }
+            } finally {
+                conn.disconnect()
+            }
+        }
+    }
+
+    // يرجع (min ping, jitter) بعد 10 عينات
+    private fun measurePing(server: String): Pair<Double, Double> {
         val times = mutableListOf<Double>()
-        repeat(5) {
+        repeat(10) {
             val start = System.nanoTime()
-            val conn = URL("https://speed.cloudflare.com/__down?bytes=0")
-                .openConnection() as HttpURLConnection
+            val conn = URL("$server/__down?bytes=0").openConnection() as HttpURLConnection
             conn.connectTimeout = 5000
             conn.readTimeout = 5000
-            conn.inputStream.use { it.readBytes() }
-            conn.disconnect()
-            times.add((System.nanoTime() - start) / 1_000_000.0)
+            try {
+                conn.inputStream.use { it.readBytes() }
+            } finally {
+                conn.disconnect()
+            }
+            times.add((System.nanoTime() - start) / 1e6)
         }
-        return times.minOrNull() ?: 0.0
+        val min = times.minOrNull() ?: 0.0
+        val diffs = times.zipWithNext { a, b -> abs(b - a) }
+        val jitter = if (diffs.isEmpty()) 0.0 else diffs.average()
+        return min to jitter
     }
 
-    private fun measureDownload(): Double {
-        val bytes = 25_000_000
-        val start = System.nanoTime()
-        val conn = URL("https://speed.cloudflare.com/__down?bytes=$bytes")
-            .openConnection() as HttpURLConnection
-        conn.connectTimeout = 10000
-        conn.readTimeout = 30000
-        val total = conn.inputStream.use { it.readBytes().size.toLong() }
-        conn.disconnect()
-        val sec = (System.nanoTime() - start) / 1_000_000_000.0
-        return (total * 8) / sec / 1_000_000
-    }
-
-    private fun measureUpload(): Double {
-        val size = 5_000_000
-        val start = System.nanoTime()
-        val conn = URL("https://speed.cloudflare.com/__up")
-            .openConnection() as HttpURLConnection
-        conn.requestMethod = "POST"
-        conn.doOutput = true
-        conn.connectTimeout = 10000
-        conn.readTimeout = 30000
-        conn.setFixedLengthStreamingMode(size)
-        conn.outputStream.use { it.write(ByteArray(size)) }
-        conn.inputStream.use { it.readBytes() }
-        conn.disconnect()
-        val sec = (System.nanoTime() - start) / 1_000_000_000.0
-        return (size * 8) / sec / 1_000_000
+    // يختار السيرفر صاحب أقل بنق
+    private fun pickServer(): Pair<String, Pair<Double, Double>> {
+        val results = servers.map { it to measurePing(it) }
+        return results.minByOrNull { it.second.first }!!
     }
 
     override fun onDestroy() {
