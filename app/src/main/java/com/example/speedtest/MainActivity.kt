@@ -1,7 +1,6 @@
 package com.example.speedtest
 
 import android.os.Bundle
-import android.widget.Button
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.coroutines.*
@@ -11,41 +10,52 @@ import java.net.URL
 class MainActivity : AppCompatActivity() {
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private var running = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        val btn = findViewById<Button>(R.id.goBtn)
+        val gauge = findViewById<GaugeView>(R.id.gauge)
+        val goBtn = findViewById<TextView>(R.id.goBtn)
         val speedText = findViewById<TextView>(R.id.speedText)
+        val unitText = findViewById<TextView>(R.id.unitText)
         val statusText = findViewById<TextView>(R.id.statusText)
-        val pingText = findViewById<TextView>(R.id.pingText)
-        val downText = findViewById<TextView>(R.id.downText)
-        val upText = findViewById<TextView>(R.id.upText)
+        val pingValue = findViewById<TextView>(R.id.pingValue)
+        val downValue = findViewById<TextView>(R.id.downValue)
+        val upValue = findViewById<TextView>(R.id.upValue)
 
-        btn.setOnClickListener {
-            btn.isEnabled = false
+        goBtn.setOnClickListener {
+            if (running) return@setOnClickListener
+            running = true
+            goBtn.text = "Testing..."
             scope.launch {
                 try {
-                    statusText.text = "قياس البنق..."
-                    val ping = withContext(Dispatchers.IO) { measurePing() }
-                    pingText.text = "%.0f ms\nالبنق".format(ping)
-
-                    statusText.text = "قياس التحميل..."
+                    statusText.text = "Measuring ping"
                     speedText.text = "..."
+                    unitText.text = "ms"
+                    val ping = withContext(Dispatchers.IO) { measurePing() }
+                    pingValue.text = "%.0f ms".format(ping)
+
+                    statusText.text = "Testing download"
+                    unitText.text = "Mbps"
                     val down = withContext(Dispatchers.IO) { measureDownload() }
-                    downText.text = "%.1f\nالتحميل".format(down)
-                    speedText.text = "%.0f".format(down)
+                    gauge.setSpeed(down)
+                    speedText.text = "%.1f".format(down)
+                    downValue.text = "%.1f Mbps".format(down)
 
-                    statusText.text = "قياس الرفع..."
+                    statusText.text = "Testing upload"
                     val up = withContext(Dispatchers.IO) { measureUpload() }
-                    upText.text = "%.1f\nالرفع".format(up)
+                    gauge.setSpeed(up)
+                    speedText.text = "%.1f".format(up)
+                    upValue.text = "%.1f Mbps".format(up)
 
-                    statusText.text = "اكتمل الفحص ✓"
+                    statusText.text = "Test complete"
                 } catch (e: Exception) {
-                    statusText.text = "خطأ: ${e.message}"
+                    statusText.text = "Error: ${e.message}"
                 } finally {
-                    btn.isEnabled = true
+                    running = false
+                    goBtn.text = "Start test"
                 }
             }
         }
@@ -55,7 +65,8 @@ class MainActivity : AppCompatActivity() {
         val times = mutableListOf<Double>()
         repeat(5) {
             val start = System.nanoTime()
-            val conn = URL("https://speed.cloudflare.com/__down?bytes=0").openConnection() as HttpURLConnection
+            val conn = URL("https://speed.cloudflare.com/__down?bytes=0")
+                .openConnection() as HttpURLConnection
             conn.connectTimeout = 5000
             conn.readTimeout = 5000
             conn.inputStream.use { it.readBytes() }
@@ -68,7 +79,8 @@ class MainActivity : AppCompatActivity() {
     private fun measureDownload(): Double {
         val bytes = 25_000_000
         val start = System.nanoTime()
-        val conn = URL("https://speed.cloudflare.com/__down?bytes=$bytes").openConnection() as HttpURLConnection
+        val conn = URL("https://speed.cloudflare.com/__down?bytes=$bytes")
+            .openConnection() as HttpURLConnection
         conn.connectTimeout = 10000
         conn.readTimeout = 30000
         val total = conn.inputStream.use { it.readBytes().size.toLong() }
@@ -80,7 +92,8 @@ class MainActivity : AppCompatActivity() {
     private fun measureUpload(): Double {
         val size = 5_000_000
         val start = System.nanoTime()
-        val conn = URL("https://speed.cloudflare.com/__up").openConnection() as HttpURLConnection
+        val conn = URL("https://speed.cloudflare.com/__up")
+            .openConnection() as HttpURLConnection
         conn.requestMethod = "POST"
         conn.doOutput = true
         conn.connectTimeout = 10000
