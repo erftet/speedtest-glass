@@ -2,6 +2,7 @@ package com.example.speedtest
 
 import android.os.Bundle
 import android.content.SharedPreferences
+import android.view.MotionEvent
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.coroutines.*
@@ -15,7 +16,6 @@ class MainActivity : AppCompatActivity() {
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var testJob: Job? = null
 
-    // أضف هنا روابط سيرفرات إضافية إذا توفرت، يختار التطبيق الأسرع تلقائياً
     private val servers = listOf("https://speed.cloudflare.com")
     private val parallelStreams = 4
     private val phaseMs = 10_000L
@@ -34,17 +34,29 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        gauge = findViewById<GaugeView>(R.id.gauge)
-        goBtn = findViewById<TextView>(R.id.goBtn)
-        speedText = findViewById<TextView>(R.id.speedText)
-        unitText = findViewById<TextView>(R.id.unitText)
-        statusText = findViewById<TextView>(R.id.statusText)
-        pingValue = findViewById<TextView>(R.id.pingValue)
-        downValue = findViewById<TextView>(R.id.downValue)
-        upValue = findViewById<TextView>(R.id.upValue)
+        gauge = findViewById(R.id.gauge)
+        goBtn = findViewById(R.id.goBtn)
+        speedText = findViewById(R.id.speedText)
+        unitText = findViewById(R.id.unitText)
+        statusText = findViewById(R.id.statusText)
+        pingValue = findViewById(R.id.pingValue)
+        downValue = findViewById(R.id.downValue)
+        upValue = findViewById(R.id.upValue)
 
         val prefs = getSharedPreferences("speedtest", MODE_PRIVATE)
         prefs.getString("last", null)?.let { statusText.text = "Last: $it" }
+
+        goBtn.setOnTouchListener { view, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    view.animate().scaleX(0.96f).scaleY(0.96f).setDuration(120).start()
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    view.animate().scaleX(1f).scaleY(1f).setDuration(150).start()
+                }
+            }
+            false
+        }
 
         goBtn.setOnClickListener {
             val current = testJob
@@ -99,7 +111,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // يشغّل مرحلة واحدة (تحميل أو رفع) مع عداد حي وإرجاع المتوسط
     private suspend fun runPhase(
         worker: (AtomicLong, Long, () -> Boolean) -> Unit
     ): Double = coroutineScope {
@@ -107,7 +118,6 @@ class MainActivity : AppCompatActivity() {
         val deadline = System.currentTimeMillis() + phaseMs
         val start = System.nanoTime()
 
-        // تحديث العداد الحي كل 250ms على الـ Main thread
         val ticker = launch(Dispatchers.Main) {
             var lastBytes = 0L
             var lastTime = System.nanoTime()
@@ -192,7 +202,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // يرجع (min ping, jitter) بعد 10 عينات
     private fun measurePing(server: String): Pair<Double, Double> {
         val times = mutableListOf<Double>()
         repeat(10) {
@@ -213,7 +222,6 @@ class MainActivity : AppCompatActivity() {
         return min to jitter
     }
 
-    // يختار السيرفر صاحب أقل بنق
     private fun pickServer(): Pair<String, Pair<Double, Double>> {
         val results = servers.map { it to measurePing(it) }
         return results.minByOrNull { it.second.first }!!
